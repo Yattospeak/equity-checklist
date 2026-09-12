@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 生成的产物（报告文件名含公司名称，避免误提交）
+*检查表分析报告.html
+*_metrics.json
+*_scores.json
+metrics.json
+scores.json
+
+# 本地安装元数据
+_user_meta.json
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.env.local
