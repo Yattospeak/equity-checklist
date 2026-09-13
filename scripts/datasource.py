@@ -228,14 +228,60 @@ def quote(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
             "currency": "HKD" if is_hk else "CNY",
         }
         if is_hk:
-            # 港股字段布局与 A 股不同
-            rec.update({"pe_ttm": f(45), "mcap_yi": f(44), "pb": f(46)})
+            # 港股字段布局与 A 股不同（实测 hk00700，78 个字段）：
+            #   [39]=15.67 是 PE(TTM)   —— 用市值/归母净利反推验证过，落在 14.95~15.96 区间
+            #   [44][45]=38997.94 是总市值（亿港元），不是 PE
+            #   [46] 是英文名 TENCENT，不是 PB
+            # PB 在腾讯行情里无可靠索引（各候选位均与反推值对不上），
+            # 且此阶段尚未取得财报、算不出净资产，故先置 None，
+            # 由 collect 在用归母净资产算出后回填（见 hk_pb_from_equity）。
+            rec.update({"pe_ttm": f(39), "mcap_yi": f(44), "pb": None})
         else:
             rec.update({"pe_ttm": f(39), "mcap_yi": f(44), "pb": f(46),
                         "pe_static": f(52) if len(v) > 52 else 0.0,
                         "turnover_pct": f(38)})
         out[code] = rec
     return out
+
+
+def hk_pb_from_equity(code: str, equity_parent_cny: Optional[float],
+                      price_hkd: float, fx_hkd_to_cny: float = 0.92) -> Optional[float]:
+    """
+    由归母净资产反推港股 PB。
+
+    为什么不用行情接口的 PB 字段：
+      1. 腾讯行情港股 78 个字段里没有可确证为 PB 的索引——实测各候选位
+         均与「股价 / 每股净资产」的反推值（腾讯约 3.7）对不上；
+      2. 东财 push2 域名在本环境常因代理不可达，且 datacenter 无港股估值报表。
+    与其猜一个错值，不如用财报里的归母净资产自己算，口径可控、可复核。
+    """
+    if not equity_parent_cny or not price_hkd:
+        return None
+    try:
+        shares = hk_total_shares(code)
+        if not shares:
+            return None
+        nav_per_share_hkd = (equity_parent_cny * fx_hkd_to_cny) / shares
+        if nav_per_share_hkd <= 0:
+            return None
+        return round(price_hkd / nav_per_share_hkd, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def hk_total_shares(code: str) -> Optional[float]:
+    """港股总股本。优先用东财 F10 股本结构，失败则用市值 / 股价反推。"""
+    rows = em_datacenter("RPT_HKF10_INFO_EQUITY",
+                         filter_str=f'(SECUCODE="{code.zfill(5)}.HK")',
+                         page_size=5)
+    for r in rows or []:
+        for k, v in r.items():
+            if "SHARES" in k.upper() and "TOTAL" in k.upper() and v:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -285,11 +331,12 @@ EM_DATACENTER = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
 
 def em_datacenter(report_name: str, columns: str = "ALL", filter_str: str = "",
-                  page_size: int = 50, sort_columns: str = "", sort_types: str = "-1"):
+                  page_size: int = 50, sort_columns: str = "", sort_types: str = "-1",
+                  page_number: int = 1):
     try:
         r = HTTP.get(EM_DATACENTER, params={
             "reportName": report_name, "columns": columns, "filter": filter_str,
-            "pageNumber": "1", "pageSize": str(page_size),
+            "pageNumber": str(page_number), "pageSize": str(page_size),
             "sortColumns": sort_columns, "sortTypes": sort_types,
             "source": "WEB", "client": "WEB"}, timeout=20)
         d = r.json()
@@ -308,6 +355,149 @@ def em_statements(secucode: str, periods: int = 12) -> Dict[str, List[Dict]]:
                              page_size=periods, sort_columns="REPORT_DATE",
                              sort_types="-1")
         out[key] = rows or []
+    return out
+
+
+# --------------------------------------------------------------------------
+# 港股财报（东财 HKF10 系列）
+#
+# 与 A 股的两点根本差异，必须显式处理，否则指标会全错：
+#   1) 数据结构是**纵表**：每行是「科目名 + 金额」，需按报告期转置成横表
+#   2) 科目名是**中国香港财务准则**：营业额 / 毛利 / 股东应占溢利 / 总资产 ...
+#      与 A 股的「营业总收入 / 归属于母公司所有者的净利润」不是一回事
+#
+# 覆盖范围（已实测 00700.HK）：
+#   ✅ 利润表 RPT_HKF10_FN_INCOME      19 期（2021-2026），人民币计价
+#   ✅ 负债表 RPT_HKF10_FN_BALANCE      科目齐全，可算净现金/负债率/ROE
+#   ❌ 现金流量表                        东财未开放对应报表，OCF 类指标只能标缺失
+#   ❌ 分红 / 股东户数 / 公告             无免登录公开源
+# --------------------------------------------------------------------------
+EM_HK_REPORTS = {
+    "income": "RPT_HKF10_FN_INCOME",
+    "balance": "RPT_HKF10_FN_BALANCE",
+}
+
+# 港股科目名 -> 内部通用名（沿用 A 股口径，使下游 compute_metrics 无需改动）
+HK_ITEM_ALIAS = {
+    "income": {
+        "营业额": "营业总收入",
+        "营运收入": "营业收入",
+        "毛利": "毛利润",
+        "经营溢利": "营业利润",
+        "除税前溢利": "利润总额",
+        "除税后溢利": "净利润",
+        "股东应占溢利": "归属于母公司所有者的净利润",
+        "每股基本盈利": "基本每股收益",
+        "销售及分销费用": "销售费用",
+        "行政开支": "管理费用",
+        "融资成本": "财务费用",
+        "税项": "所得税费用",
+    },
+    "balance": {
+        "总资产": "资产总计",
+        "总负债": "负债合计",
+        "净资产": "所有者权益合计",
+        # 东财港股负债表中，归母权益的科目名是「股东权益」（少数股东单列为「少数股东权益」）
+        "股东权益": "归属于母公司股东权益合计",
+        "少数股东权益": "少数股东权益",
+        "现金及等价物": "货币资金",
+        "短期存款": "短期存款",
+        "受限制存款及现金": "受限资金",
+        "指定以公允价值记账之金融资产(流动)": "交易性金融资产",
+        "短期贷款": "短期借款",
+        "长期贷款": "长期借款",
+        "应付票据(非流动)": "应付债券",
+        "存货": "存货",
+        "应收帐款": "应收账款",
+        "无形资产": "无形资产",
+        "流动资产合计": "流动资产合计",
+        "流动负债合计": "流动负债合计",
+    },
+}
+
+
+def _hk_fetch_by_period(report_name: str, secucode: str, want: int) -> List[Dict]:
+    """
+    分期拉取港股纵表财报。
+
+    东财对 pageSize 有硬上限（实测 1000 行后静默截断），而港股纵表
+    每期约 55 个科目，一次请求拿不全多期。策略：
+      1. 先只取 REPORT_DATE 列，靠排序拿到全部可用报告期
+      2. 再按报告期逐个 filter 拉取，合并结果
+    """
+    # probe 也需翻页：服务端单次最多返回 200 行，而纵表一期就占 ~55 行，
+    # 不翻页只能看到最近 4 期。翻到无新增为止。
+    period_list: List[str] = []
+    for page in range(1, 11):
+        probe = em_datacenter(report_name, columns="REPORT_DATE",
+                              filter_str=f'(SECUCODE="{secucode}")',
+                              page_size=200, page_number=page,
+                              sort_columns="REPORT_DATE", sort_types="-1")
+        if not probe:
+            break
+        before = len(period_list)
+        for r in probe:
+            p = str(r.get("REPORT_DATE") or "")[:10]
+            if p and p not in period_list:
+                period_list.append(p)
+        if len(period_list) == before:
+            break
+    if not period_list:
+        return []
+    period_list = period_list[:max(want, 1)]
+
+    # 年报优先：ROE/趋势分析只需要年报 + 最近 1 期季报。
+    # 逐个期请求受 1.2s 限流制约，无脑全拉会拖到 80s+，这里做两次取舍：
+    #   1. 年报全部保留
+    #   2. 非年报只保留最近 3 期（够反映最新经营状况）
+    annual = [p for p in period_list if p.endswith("12-31")]
+    others = [p for p in period_list if not p.endswith("12-31")][:3]
+    fetch_list = sorted(set(annual + others), reverse=True)
+
+    all_rows: List[Dict] = []
+    for p in fetch_list:
+        rows = em_datacenter(report_name, filter_str=f'(SECUCODE="{secucode}")'
+                                                     f"(REPORT_DATE='{p}')",
+                             page_size=300, sort_columns="REPORT_DATE",
+                             sort_types="-1")
+        if rows:
+            all_rows.extend(rows)
+    return all_rows
+
+
+def hk_statements(secucode: str, periods: int = 12) -> Dict[str, List[Dict]]:
+    """
+    港股财报（东财 HKF10）。
+
+    返回结构对齐 A 股：{'income':[{报告期, 科目...}], 'balance':[...], 'cashflow':[]}
+    港股无现金流量表源，cashflow 恒为空列表——下游须据此标注指标缺失，
+    绝不能用 0 填充（会把「数据不足」伪装成「经营现金流为负」）。
+    """
+    out: Dict[str, List[Dict]] = {"income": [], "balance": [], "cashflow": []}
+    for key, rn in EM_HK_REPORTS.items():
+        # 纵表每期约 55 个科目，而东财单次上限 1000 行——直接要大 pageSize
+        # 会被服务端静默截断（实测 1000 行只覆盖 18 期），故按报告期逐个拉取。
+        rows = _hk_fetch_by_period(rn, secucode, want=max(periods * 3, 24))
+        if not rows:
+            continue
+        # 纵表 -> 横表：按报告期聚合科目
+        by_period: Dict[str, Dict] = {}
+        for r in rows:
+            p = str(r.get("REPORT_DATE") or "")[:10]
+            if not p:
+                continue
+            raw_name = (r.get("ITEM_NAME") or "").strip()
+            amount = r.get("AMOUNT")
+            if not raw_name or amount is None:
+                continue
+            name = HK_ITEM_ALIAS[key].get(raw_name, raw_name)
+            rec = by_period.setdefault(p, {"报告期": p})
+            # 同名科目只取首次出现（避免不同子表重复覆盖）
+            if name not in rec:
+                rec[name] = amount
+        # 按报告期倒序取最近 N 期。年报自然落在其中，下游 is_annual() 会筛出年度序列
+        kept = sorted(by_period.values(), key=lambda r: r["报告期"], reverse=True)
+        out[key] = kept[:periods]
     return out
 
 

@@ -279,8 +279,15 @@ def score_management(d: Dict) -> Dict[str, Any]:
     # 1) 分红（0-6）
     dy = m.get("股息率%")
     payout = m.get("派息率%")
-    if dy is None or not divs:
-        card_notes.append("无分红 0/6")
+    # 关键区分：「确认无分红」与「数据缺失」不是一回事。
+    # 港股无分红数据源时 divs 为空，若直接记 0/6，等于把"不知道"当成"不分红"，
+    # 会凭空拉低资本配置分、误触规则A（子维度≤2）。缺失时按中性 3/6 并显式标注。
+    div_data_available = bool(d.get("meta", {}).get("_dividend_source"))
+    if not divs and not div_data_available:
+        card += 3
+        card_notes.append("分红数据缺失（该市场无公开分红源）→ 按中性 3/6，非 0 分")
+    elif dy is None or not divs:
+        card_notes.append("确认无分红 0/6")
     else:
         if dy >= 4:
             c = 6
@@ -296,6 +303,8 @@ def score_management(d: Dict) -> Dict[str, Any]:
         card_notes.append(f"分红：股息率 {dy}%（派息率 {payout}%）{c}/6")
 
     # 2) 回购/增持（0-6）
+    #    同样区分「未检索到」与「无公告源」：港股取不到公告时不能记为 0 分
+    ann_available = bool(d.get("meta", {}).get("_announcement_source"))
     has_buyback = ("回购" in titles)
     has_increase = ("增持" in titles)
     if has_buyback:
@@ -304,6 +313,9 @@ def score_management(d: Dict) -> Dict[str, Any]:
     elif has_increase:
         card += 4
         card_notes.append("存在大股东增持 4/6")
+    elif not ann_available:
+        card += 3
+        card_notes.append("公告源不可用（无法判断回购/增持）→ 按中性 3/6")
     else:
         card_notes.append("未见回购/增持 0/6")
 
@@ -312,6 +324,9 @@ def score_management(d: Dict) -> Dict[str, Any]:
                 "配股" in titles, "募集资金" in titles)
     if any(raise_kw):
         card_notes.append("存在再融资/募资公告 0/6（须核查募资使用进度）")
+    elif not ann_available:
+        card += 3
+        card_notes.append("公告源不可用（无法判断再融资）→ 按中性 3/6")
     else:
         card += 6
         card_notes.append("未见再融资 6/6")
@@ -482,19 +497,23 @@ def auto_score(d: Dict) -> Dict[str, Any]:
 
 
 def decision_text(total: float, low: List[str]) -> str:
+    """
+    三档评级：优 / 中 / 低。
+
+    刻意不使用「买入 / 卖出」类措辞——本工具不是投资顾问，
+    输出的是基于公开财报的量化评级，而非交易指令。
+
+    阈值沿用原五档体系的分界（优≈原「买入」及以上，中≈原「谨慎」区间），
+    保证改档不影响历史报告的可比性。
+    """
+    # 硬性闸门：任一维度 <3.0 一律降级为「低」
     if low:
-        return "回避" if total >= 2.0 else "拒绝"
-    if total >= 4.2:
-        return "强烈买入"
+        return "低"
     if total >= 3.8:
-        return "买入"
-    if total >= 3.4:
-        return "买入谨慎"
+        return "优"
     if total >= 3.0:
-        return "谨慎"
-    if total >= 2.5:
-        return "中性"
-    return "回避"
+        return "中"
+    return "低"
 
 
 def main():

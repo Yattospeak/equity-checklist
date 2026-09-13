@@ -57,13 +57,20 @@ def num(row: Dict, *aliases, default=0.0) -> float:
 
 
 def yi(v: Optional[float], digits=2):
-    """元 -> 亿元"""
-    if v in (None, "", 0):
-        return 0.0
+    """
+    元 -> 亿元。
+
+    None 保持 None：数据缺失必须能穿透到下游，若在这里退化成 0.0，
+    「无数据」会被误读成「该科目为 0」（例如把经营现金流缺失当成现金流为负）。
+    """
+    if v is None or v == "":
+        return None
     try:
+        if float(v) == 0:
+            return 0.0
         return round(float(v) / YI, digits)
     except (TypeError, ValueError):
-        return 0.0
+        return None
 
 
 def safe_div(a, b, digits=4, default=None):
@@ -114,18 +121,32 @@ def compute_metrics(series: List[Dict], quote: Dict) -> Dict[str, Any]:
 
     revenue = num(inc, "营业总收入", "营业收入")
     net_profit = num(inc, "归属于母公司所有者的净利润", "净利润")
-    gross_profit = revenue - num(inc, "营业成本")
+    # 毛利率：A 股用「营收 - 营业成本」；港股利润表无「营业成本」科目，
+    # 但直接披露「毛利润」——优先取披露值，否则退回收入减成本。
+    # 若两者都拿不到，必须置 None 而非 0，否则毛利率会被算成 100%。
+    gp_disclosed = num(inc, "毛利润", default=None)
+    cost = num(inc, "营业成本", default=None)
+    if gp_disclosed is not None:
+        gross_profit = gp_disclosed
+    elif cost is not None:
+        gross_profit = revenue - cost
+    else:
+        gross_profit = None
     invest_income = num(inc, "投资收益")
     fv_change = num(inc, "公允价值变动收益")
     op_profit = num(inc, "营业利润")
 
-    ocf = num(cf, "经营活动产生的现金流量净额")
-    icf = num(cf, "投资活动产生的现金流量净额")
-    fcf = num(cf, "筹资活动产生的现金流量净额")
-    capex = num(cf, "购建固定资产、无形资产和其他长期资产所支付的现金")
+    # 现金流缺失（如港股无现金流量表源）时必须返回 None，
+    # 不能返回 0——0 会被下游解读成「经营现金流为负」，是严重误判。
+    ocf = num(cf, "经营活动产生的现金流量净额", default=None)
+    icf = num(cf, "投资活动产生的现金流量净额", default=None)
+    fcf = num(cf, "筹资活动产生的现金流量净额", default=None)
+    capex = num(cf, "购建固定资产、无形资产和其他长期资产所支付的现金", default=None)
 
     cash = num(bal, "货币资金")
     tradable = num(bal, "交易性金融资产")
+    # 港股特有：短期存款是独立于「货币资金」披露的现金类资产
+    short_deposit = num(bal, "短期存款")
     ar = num(bal, "应收账款", "应收票据及应收账款")
     inventory = num(bal, "存货")
     goodwill = num(bal, "商誉")
@@ -144,7 +165,9 @@ def compute_metrics(series: List[Dict], quote: Dict) -> Dict[str, Any]:
     lt_loan = num(bal, "长期借款")
     bond = num(bal, "应付债券")
     due_1y = num(bal, "一年内到期的非流动负债")
-    interest_debt = st_loan + lt_loan + bond + due_1y
+    # 港股融资租赁负债属于有息负债，A 股该科目通常为 0，故可直接相加
+    lease = num(bal, "融资租赁负债(流动)", "融资租赁负债(非流动)")
+    interest_debt = st_loan + lt_loan + bond + due_1y + lease
 
     equity_total = num(bal, "所有者权益(或股东权益)合计", "所有者权益合计") or equity_parent
 
@@ -160,9 +183,10 @@ def compute_metrics(series: List[Dict], quote: Dict) -> Dict[str, Any]:
         e_ = num(b, "归属于母公司股东权益合计", "归属于母公司所有者权益合计",
                  "归属于母公司股东的权益", "归属于母公司所有者权益",
                  "归属于母公司的股东权益合计")
-        o_ = num(c, "经营活动产生的现金流量净额")
+        o_ = num(c, "经营活动产生的现金流量净额", default=None)
         rev_hist.append({"报告期": s["报告期"][:4], "营收亿": yi(r_), "归母净利亿": yi(n_),
-                         "OCF亿": yi(o_), "OCF/净利": safe_div(o_, n_, 3)})
+                         "OCF亿": yi(o_) if o_ is not None else None,
+                         "OCF/净利": safe_div(o_, n_, 3)})
         np_hist.append(yi(n_))
         if e_:
             roe_hist.append({"报告期": s["报告期"][:4], "ROE%": pct(safe_div(n_, e_, 4))})
@@ -212,13 +236,15 @@ def compute_metrics(series: List[Dict], quote: Dict) -> Dict[str, Any]:
         "资产负债率%": pct(safe_div(total_liab, total_assets)),
         "OCF亿": yi(ocf),
         "OCF/净利": safe_div(ocf, net_profit, 3),
-        "自由现金流亿": yi(ocf - capex),
+        "自由现金流亿": yi(ocf - capex) if (ocf is not None and capex is not None) else None,
         "投资净流亿": yi(icf),
         "筹资净流亿": yi(fcf),
         "货币资金亿": yi(cash),
         "交易性金融资产亿": yi(tradable),
         "有息负债亿": yi(interest_debt),
-        "净现金亿": yi(cash + tradable - interest_debt),
+        # 港股把存款单列为「短期存款」（腾讯 2025 年报该项 2143 亿），
+        # 不计入会严重低估现金、把净现金算成大额负值
+        "净现金亿": yi(cash + tradable + short_deposit - interest_debt),
         "商誉亿": yi(goodwill),
         "商誉/净资产%": pct(safe_div(goodwill, equity_parent)) if equity_parent else 0.0,
         "合同负债亿": yi(contract_liab),
@@ -431,15 +457,35 @@ def collect(query: str, periods: int = 12, with_anns: bool = True) -> Dict[str, 
         result["quote"] = {}
         result["meta"]["warnings"].append(f"行情获取失败: {e}")
 
-    # 2. 财报（主源新浪；港股无覆盖，降级为东财尝试）
-    st = ds.sina_statements(market, code, periods=periods)
-    if not any(st.values()):
-        result["meta"]["warnings"].append("新浪财报源不可用，尝试东财 DMSK 备源")
-        st = ds.em_statements(secucode, periods=periods)
-    if not any(st.values()):
-        result["meta"]["warnings"].append(
-            "财报数据不可用（港股暂未接入专用财务源），仅提供行情与估值")
+    # 2. 财报
+    #    A 股：主源新浪（字段全），失败降级东财 DMSK
+    #    港股：东财 HKF10 专用源（纵表 + 中国香港准则科目，已在 datasource 层转置对齐）
+    if is_hk:
+        st = ds.hk_statements(secucode, periods=periods)
+        if not any(st.values()):
+            result["meta"]["warnings"].append(
+                "港股财报源不可用（东财 HKF10 未覆盖该标的），仅提供行情与估值")
+    else:
+        st = ds.sina_statements(market, code, periods=periods)
+        if not any(st.values()):
+            result["meta"]["warnings"].append("新浪财报源不可用，尝试东财 DMSK 备源")
+            st = ds.em_statements(secucode, periods=periods)
+        if not any(st.values()):
+            result["meta"]["warnings"].append(
+                "财报数据不可用，仅提供行情与估值")
     result["statements"] = st
+
+    # 2b. 港股 PB 回填：行情源无可靠 PB 字段，用归母净资产反推
+    if is_hk and result["quote"].get("price"):
+        latest_bal = None
+        for row in (st.get("balance") or []):
+            latest_bal = row
+            break
+        if latest_bal:
+            eq = num(latest_bal, "归属于母公司股东权益合计", default=None)
+            pb = ds.hk_pb_from_equity(code, eq, result["quote"]["price"])
+            if pb:
+                result["quote"]["pb"] = pb
 
     series = align_periods(st.get("income"), st.get("balance"), st.get("cashflow"),
                            limit=periods)
@@ -449,12 +495,23 @@ def collect(query: str, periods: int = 12, with_anns: bool = True) -> Dict[str, 
     if not is_hk:
         result["dividends"] = ds.dividend_history(code)
         result["holders"] = ds.holder_num(code)
+        # 标记分红源可用：下游据此区分「确认无分红」与「数据缺失」
+        result["meta"]["_dividend_source"] = True
     else:
         result["dividends"] = []
         result["holders"] = []
-        result["meta"]["warnings"].append("港股分红/股东户数未接入，相关指标为 None")
+        result["meta"]["_dividend_source"] = False
+        result["meta"]["warnings"].append(
+            "【港股数据边界】分红与股东户数暂无免登录公开源，股息率/派息率/资本配置中的"
+            "分红项按缺失处理（中性计分，不计 0 分），估值维度因此偏保守")
 
-    result["announcements"] = ds.announcements(code) if (with_anns and not is_hk) else []
+    if is_hk:
+        # 巨潮只覆盖 A 股，港股无免登录公告源
+        result["announcements"] = []
+        result["meta"]["_announcement_source"] = False
+    else:
+        result["announcements"] = ds.announcements(code) if with_anns else []
+        result["meta"]["_announcement_source"] = bool(with_anns)
 
     # 4. 每股口径（股息率/派息率）
     result["per_share"] = build_per_share(result["dividends"], series, result["quote"])
@@ -510,11 +567,19 @@ def collect(query: str, periods: int = 12, with_anns: bool = True) -> Dict[str, 
         result["metrics"], result["announcements"], result["dividends"], result["quote"])
 
     # 8. 港股支持度标注
-    if is_hk and not series:
-        result["meta"]["partial_support"] = True
-        result["meta"]["warnings"].append(
-            "【港股支持度】当前版本未接入港股专用财务源，仅提供行情与估值，"
-            "财务/管理层维度无法评估。如需完整分析，请提供对应 A 股代码或另行接入数据源。")
+    if is_hk:
+        # 财报已接入，但现金流量表无源——OCF 类指标必须显式标缺失，
+        # 绝不能让「无数据」被误读成「经营现金流为负」。
+        if not (st.get("cashflow") or []):
+            result["meta"]["partial_support"] = True
+            result["meta"]["warnings"].append(
+                "【港股数据边界】现金流量表暂无免登录公开源，"
+                "OCF/净利、自由现金流等指标按缺失处理（中性计分，非 0 分）。")
+        if not series:
+            result["meta"]["partial_support"] = True
+            result["meta"]["warnings"].append(
+                "【港股支持度】未能获取该标的财报（东财 HKF10 未覆盖），"
+                "仅提供行情与估值，财务/管理层维度无法评估。")
 
     result["meta"]["elapsed_sec"] = round((datetime.now() - started).total_seconds(), 1)
     result["meta"]["data_completeness"] = {
